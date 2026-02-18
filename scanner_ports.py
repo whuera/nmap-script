@@ -5,18 +5,21 @@ Creado por William Huera.
 """
 
 import glob
+import json
 import os
 import re
 import shutil
 import subprocess
 import threading
 import tkinter as tk
+import urllib.request
+import urllib.error
 from tkinter import scrolledtext, filedialog, messagebox
 from datetime import datetime
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
-from ttkbootstrap.scrolled import ScrolledFrame
+from ttkbootstrap.widgets.scrolled import ScrolledFrame
 
 
 # ─── Constante de escaneos ────────────────────────────────────────────────────
@@ -134,6 +137,28 @@ class ScannerApp(ttk.Window):
             cb = ttk.Checkbutton(left, text=scan["label"], variable=var, bootstyle="info-round-toggle")
             cb.pack(anchor=W, pady=2)
 
+        # Separador
+        ttk.Separator(left).pack(fill=X, pady=(12, 10))
+
+        # ── Sugerencia IA (n8n) ──
+        ttk.Label(left, text="Sugerencia IA (n8n):", font=("-size", 11)).pack(anchor=W, pady=(0, 4))
+        self._ia_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            left, text="Sugerencia IA", variable=self._ia_var,
+            bootstyle="warning-round-toggle", command=self._toggle_webhook_entry,
+        ).pack(anchor=W, pady=2)
+
+        self._webhook_frame = ttk.Frame(left)
+        self._webhook_frame.pack(fill=X, pady=(4, 0))
+        ttk.Label(self._webhook_frame, text="Webhook URL:", font=("-size", 9)).pack(anchor=W)
+        self._webhook_var = ttk.StringVar(value="https://whuera.app.n8n.cloud/webhook-test/29953877-1012-4b79-9800-52c6aa815bcf")
+        self._webhook_entry = ttk.Entry(
+            self._webhook_frame, textvariable=self._webhook_var, font=("-size", 9), width=28
+        )
+        self._webhook_entry.pack(fill=X, pady=(2, 0))
+        # Ocultar inicialmente
+        self._webhook_frame.pack_forget()
+
         # Botones
         btn_frame = ttk.Frame(left)
         btn_frame.pack(fill=X, pady=(20, 0))
@@ -153,7 +178,15 @@ class ScannerApp(ttk.Window):
             width=20,
             state=DISABLED,
         )
-        self._stop_btn.pack(fill=X)
+        self._stop_btn.pack(fill=X, pady=(0, 6))
+        self._reset_btn = ttk.Button(
+            btn_frame,
+            text="🔄  Nuevo Escaneo",
+            command=self._reset_scan,
+            bootstyle="info-outline",
+            width=20,
+        )
+        self._reset_btn.pack(fill=X)
 
         # ── Panel derecho (resultados) ──
         right = ttk.Frame(body)
@@ -210,6 +243,11 @@ class ScannerApp(ttk.Window):
         reports_frame = ttk.Frame(self._notebook, padding=5)
         self._notebook.add(reports_frame, text="  📄 Reportes  ")
         self._build_reports_tab(reports_frame)
+
+        # Pestaña de Sugerencia IA
+        ia_frame = ttk.Frame(self._notebook, padding=5)
+        self._notebook.add(ia_frame, text="  🤖 Sugerencia IA  ")
+        self._build_ia_tab(ia_frame)
 
         # Estado inferior
         footer = ttk.Frame(self, padding=(15, 6))
@@ -322,7 +360,489 @@ class ScannerApp(ttk.Window):
 
         self._report_info_label.config(text=os.path.basename(filepath))
 
+    # ── Pestaña de Sugerencia IA ──────────────────────────────────────────────
+    def _build_ia_tab(self, parent: ttk.Frame):
+        """Construye la pestaña de sugerencias IA con visor + snippets."""
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill=X, pady=(0, 6))
+
+        self._ia_send_btn = ttk.Button(
+            toolbar, text="🚀 Enviar resultados a n8n",
+            command=self._send_to_n8n_manual, bootstyle="warning-outline",
+        )
+        self._ia_send_btn.pack(side=LEFT)
+
+        self._ia_status_label = ttk.Label(
+            toolbar, text="Activa 'Sugerencia IA' para enviar automáticamente al finalizar",
+            font=("-size", 10), bootstyle="secondary",
+        )
+        self._ia_status_label.pack(side=RIGHT)
+
+        # PanedWindow vertical para dividir sugerencias y snippets
+        paned = ttk.Panedwindow(parent, orient=tk.VERTICAL)
+        paned.pack(fill=BOTH, expand=True)
+
+        # ── Panel superior: sugerencias formateadas ──
+        top_frame = ttk.Labelframe(paned, text="  📝 Sugerencias  ", padding=5, bootstyle="warning")
+        self._ia_text = scrolledtext.ScrolledText(
+            top_frame,
+            wrap=tk.WORD,
+            font=("Menlo", 11),
+            bg="#1a1a2e",
+            fg="#e0e0e0",
+            insertbackground="#e0e0e0",
+            selectbackground="#0f3460",
+            relief=FLAT,
+            state=DISABLED,
+        )
+        self._ia_text.pack(fill=BOTH, expand=True)
+        # Configurar tags de colores para formato
+        self._ia_text.tag_configure("header", foreground="#f0c040", font=("Menlo", 13, "bold"))
+        self._ia_text.tag_configure("subheader", foreground="#56c8ff", font=("Menlo", 11, "bold"))
+        self._ia_text.tag_configure("command", foreground="#50fa7b", font=("Menlo", 11))
+        self._ia_text.tag_configure("warning_text", foreground="#ffb86c")
+        self._ia_text.tag_configure("normal", foreground="#e0e0e0")
+        paned.add(top_frame, weight=3)
+
+        # ── Panel inferior: snippets copiables ──
+        bottom_frame = ttk.Labelframe(paned, text="  📋 Comandos sugeridos (clic para copiar)  ", padding=5, bootstyle="success")
+        self._snippets_container = ttk.Frame(bottom_frame)
+
+        # Canvas + Scrollbar para scroll de snippets
+        self._snippets_canvas = tk.Canvas(
+            self._snippets_container, bg="#1a1a2e", highlightthickness=0, height=140
+        )
+        snippets_scrollbar = ttk.Scrollbar(
+            self._snippets_container, orient=tk.VERTICAL, command=self._snippets_canvas.yview
+        )
+        self._snippets_inner = ttk.Frame(self._snippets_canvas)
+        self._snippets_inner.bind(
+            "<Configure>",
+            lambda e: self._snippets_canvas.configure(scrollregion=self._snippets_canvas.bbox("all")),
+        )
+        self._snippets_canvas.create_window((0, 0), window=self._snippets_inner, anchor="nw")
+        self._snippets_canvas.configure(yscrollcommand=snippets_scrollbar.set)
+
+        self._snippets_container.pack(fill=BOTH, expand=True)
+        self._snippets_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        snippets_scrollbar.pack(side=RIGHT, fill=Y)
+
+        paned.add(bottom_frame, weight=1)
+
+    def _toggle_webhook_entry(self):
+        """Muestra u oculta el campo de webhook URL."""
+        if self._ia_var.get():
+            self._webhook_frame.pack(fill=X, pady=(4, 0))
+        else:
+            self._webhook_frame.pack_forget()
+
+    def _set_ia_text(self, content: str):
+        """Escribe contenido en la pestaña de Sugerencia IA."""
+        self._ia_text.config(state=NORMAL)
+        self._ia_text.delete("1.0", END)
+        self._ia_text.insert("1.0", content)
+        self._ia_text.config(state=DISABLED)
+
+    def _set_ia_formatted(self, formatted_text: str, commands: list[str]):
+        """Escribe texto formateado y genera snippets copiables."""
+        # Escribir texto formateado con colores
+        self._ia_text.config(state=NORMAL)
+        self._ia_text.delete("1.0", END)
+
+        for line in formatted_text.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("═") or stripped.startswith("─"):
+                self._ia_text.insert(END, line + "\n", "header")
+            elif stripped.startswith("🤖") or stripped.startswith("📅") or stripped.startswith("🎯"):
+                self._ia_text.insert(END, line + "\n", "header")
+            elif stripped.startswith("##") or stripped.startswith("▶") or stripped.startswith("●"):
+                self._ia_text.insert(END, line + "\n", "subheader")
+            elif stripped.startswith("$") or stripped.startswith("sudo") or stripped.startswith("nmap"):
+                self._ia_text.insert(END, line + "\n", "command")
+            elif stripped.startswith("⚠") or stripped.startswith("[!"):
+                self._ia_text.insert(END, line + "\n", "warning_text")
+            else:
+                self._ia_text.insert(END, line + "\n", "normal")
+
+        self._ia_text.config(state=DISABLED)
+
+        # Generar snippets copiables
+        self._populate_snippets(commands)
+
+    def _populate_snippets(self, commands: list[str]):
+        """Crea botones de snippet para cada comando sugerido."""
+        # Limpiar snippets anteriores
+        for widget in self._snippets_inner.winfo_children():
+            widget.destroy()
+
+        if not commands:
+            ttk.Label(
+                self._snippets_inner, text="No se detectaron comandos en la respuesta.",
+                font=("-size", 10), bootstyle="secondary",
+            ).pack(anchor=W, padx=5, pady=5)
+            return
+
+        for i, cmd in enumerate(commands, 1):
+            row = ttk.Frame(self._snippets_inner)
+            row.pack(fill=X, padx=4, pady=3)
+
+            # Etiqueta del comando con fondo oscuro
+            cmd_label = tk.Label(
+                row,
+                text=f"  {cmd}  ",
+                font=("Menlo", 11),
+                bg="#16213e",
+                fg="#50fa7b",
+                anchor="w",
+                padx=8,
+                pady=4,
+                relief="ridge",
+                bd=1,
+            )
+            cmd_label.pack(side=LEFT, fill=X, expand=True)
+
+            # Botón copiar
+            copy_btn = ttk.Button(
+                row,
+                text="📋 Copiar",
+                bootstyle="success-outline",
+                width=10,
+                command=lambda c=cmd: self._copy_to_clipboard(c),
+            )
+            copy_btn.pack(side=RIGHT, padx=(6, 0))
+
+    def _copy_to_clipboard(self, text: str):
+        """Copia el texto al portapapeles y muestra confirmación."""
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._ia_status_label.config(text="✔ Comando copiado al portapapeles", bootstyle="success")
+        # Restaurar después de 2 segundos
+        self.after(2000, lambda: self._ia_status_label.config(
+            text="✔ Respuesta recibida", bootstyle="success"
+        ))
+
+    def _send_to_n8n_manual(self):
+        """Envío manual: recopila todos los resultados y los envía a n8n."""
+        target = self._target_var.get().strip()
+        if not target:
+            messagebox.showwarning("Advertencia", "Primero ingresa un objetivo y ejecuta un escaneo.")
+            return
+
+        results = {}
+        for scan in SCANS:
+            widget = self._result_texts.get(scan["key"])
+            if widget:
+                widget.config(state=NORMAL)
+                text = widget.get("1.0", END).strip()
+                widget.config(state=DISABLED)
+                if text:
+                    results[scan["key"]] = text
+
+        if not results:
+            messagebox.showinfo("Sin datos", "No hay resultados de escaneo para enviar.")
+            return
+
+        threading.Thread(
+            target=self._send_to_n8n, args=(target, results), daemon=True
+        ).start()
+
+    def _send_to_n8n(self, target: str, results: dict[str, str]):
+        """Envía los resultados del escaneo al webhook de n8n y muestra la respuesta."""
+        webhook_url = self._webhook_var.get().strip()
+        if not webhook_url:
+            self.after(0, self._set_ia_text, "Error: No se configuró la URL del webhook de n8n.")
+            return
+
+        self.after(0, self._ia_status_label.config, {"text": "Enviando a n8n…", "bootstyle": "warning"})
+        self.after(0, self._set_ia_text, "⏳ Enviando resultados al flujo de n8n...\n\nEsto puede tardar unos segundos.")
+        self.after(0, self._ia_send_btn.config, {"state": DISABLED})
+
+        # Navegar a la pestaña IA
+        ia_tab_index = self._notebook.index(END) - 1
+        self.after(0, self._notebook.select, ia_tab_index)
+
+        payload = {
+            "target": target,
+            "timestamp": datetime.now().isoformat(),
+            "results": results,
+        }
+
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                webhook_url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                raw = resp.read().decode("utf-8")
+
+            # Parsear y formatear la respuesta
+            formatted, commands = self._format_n8n_response(raw, target)
+            self.after(0, self._set_ia_formatted, formatted, commands)
+            self.after(0, self._ia_status_label.config, {"text": "✔ Respuesta recibida", "bootstyle": "success"})
+            self.after(0, self._log, "[✓] Sugerencias IA recibidas desde n8n")
+
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            err_msg = f"Error HTTP {exc.code}:\n{exc.reason}\n\n{body}"
+            self.after(0, self._set_ia_text, err_msg)
+            self.after(0, self._ia_status_label.config, {"text": f"✖ Error HTTP {exc.code}", "bootstyle": "danger"})
+            self.after(0, self._log, f"[✖] Error al enviar a n8n: HTTP {exc.code}")
+
+        except urllib.error.URLError as exc:
+            err_msg = f"Error de conexión:\n{exc.reason}\n\nVerifica que n8n esté corriendo y la URL del webhook sea correcta."
+            self.after(0, self._set_ia_text, err_msg)
+            self.after(0, self._ia_status_label.config, {"text": "✖ Error de conexión", "bootstyle": "danger"})
+            self.after(0, self._log, f"[✖] Error de conexión con n8n: {exc.reason}")
+
+        except Exception as exc:
+            err_msg = f"Error inesperado:\n{exc}"
+            self.after(0, self._set_ia_text, err_msg)
+            self.after(0, self._ia_status_label.config, {"text": "✖ Error", "bootstyle": "danger"})
+            self.after(0, self._log, f"[✖] Error inesperado con n8n: {exc}")
+
+        finally:
+            self.after(0, self._ia_send_btn.config, {"state": NORMAL})
+
+    # ── Formateo de respuesta n8n ────────────────────────────────────────────
+    def _format_n8n_response(self, raw: str, target: str) -> tuple[str, list[str]]:
+        """
+        Parsea la respuesta de n8n y la convierte en texto legible.
+        Retorna (texto_formateado, lista_de_comandos).
+        """
+        commands: list[str] = []
+        display = ""
+
+        # Intentar parsear como JSON
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+
+        if parsed is not None:
+            # Extraer el texto principal de la respuesta
+            text_content = self._extract_text_from_response(parsed)
+        else:
+            text_content = raw
+
+        # Extraer comandos del texto (líneas que parecen comandos de terminal)
+        commands = self._extract_commands(text_content)
+
+        # Construir encabezado
+        header = (
+            f"{'═' * 55}\n"
+            f"  🤖  SUGERENCIAS IA — {target}\n"
+            f"  📅  {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+            f"{'═' * 55}\n\n"
+        )
+
+        # Limpiar markdown básico para hacerlo más legible
+        cleaned = self._clean_markdown(text_content)
+
+        display = header + cleaned
+
+        if commands:
+            display += f"\n\n{'─' * 55}\n"
+            display += f"  📋  {len(commands)} comando(s) detectado(s) — ver panel inferior\n"
+            display += f"{'─' * 55}\n"
+
+        return display, commands
+
+    def _extract_text_from_response(self, data) -> str:
+        """Extrae texto legible de distintas estructuras JSON de n8n."""
+        if isinstance(data, str):
+            return data
+
+        if isinstance(data, list):
+            parts = []
+            for item in data:
+                parts.append(self._extract_text_from_response(item))
+            return "\n\n".join(parts)
+
+        if isinstance(data, dict):
+            # Buscar campos comunes de respuesta
+            for key in ["suggestion", "response", "output", "text", "message",
+                        "data", "result", "content", "answer", "reply",
+                        "recommendations", "analysis"]:
+                if key in data:
+                    val = data[key]
+                    if isinstance(val, str):
+                        return val
+                    elif isinstance(val, (dict, list)):
+                        return self._extract_text_from_response(val)
+
+            # Si no se encontró un campo conocido, formatear todo el dict
+            return json.dumps(data, indent=2, ensure_ascii=False)
+
+        return str(data)
+
+    def _extract_commands(self, text: str) -> list[str]:
+        """Extrae comandos de terminal del texto de la respuesta."""
+        commands: list[str] = []
+        lines = text.split("\n")
+
+        # Patrones de bloques de código
+        in_code_block = False
+        code_block_lines: list[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Bloques de código markdown ```
+            if stripped.startswith("```"):
+                if in_code_block:
+                    # Fin de bloque
+                    for cl in code_block_lines:
+                        cl_stripped = cl.strip()
+                        if cl_stripped and not cl_stripped.startswith("#"):
+                            cmd = cl_stripped.lstrip("$ ").strip()
+                            if cmd and cmd not in commands:
+                                commands.append(cmd)
+                    code_block_lines = []
+                    in_code_block = False
+                else:
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                code_block_lines.append(line)
+                continue
+
+            # Líneas que empiezan con $ (prompt de terminal)
+            if stripped.startswith("$ "):
+                cmd = stripped[2:].strip()
+                if cmd and cmd not in commands:
+                    commands.append(cmd)
+                continue
+
+            # Detectar comandos comunes de Linux/nmap inline
+            cmd_prefixes = (
+                "sudo ", "nmap ", "apt ", "yum ", "dnf ", "brew ",
+                "systemctl ", "service ", "iptables ", "ufw ",
+                "firewall-cmd ", "netstat ", "ss ", "curl ", "wget ",
+                "chmod ", "chown ", "grep ", "find ", "kill ", "pkill ",
+                "docker ", "nginx ", "apache2ctl ", "openssl ",
+                "ssh ", "scp ", "rsync ", "patch ", "pip ",
+            )
+            if stripped.startswith(cmd_prefixes) and len(stripped) < 200:
+                if stripped not in commands:
+                    commands.append(stripped)
+
+        return commands
+
+    def _clean_markdown(self, text: str) -> str:
+        """Limpia formato Markdown básico para mostrar texto plano legible."""
+        lines = text.split("\n")
+        cleaned: list[str] = []
+        in_code = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Bloques de código
+            if stripped.startswith("```"):
+                if not in_code:
+                    cleaned.append("  ┌─ comando ─────────────────────────")
+                    in_code = True
+                else:
+                    cleaned.append("  └─────────────────────────────────────")
+                    in_code = False
+                continue
+
+            if in_code:
+                cleaned.append(f"  │  {line}")
+                continue
+
+            # Encabezados markdown
+            if stripped.startswith("### "):
+                cleaned.append(f"\n  ▶ {stripped[4:]}")
+            elif stripped.startswith("## "):
+                cleaned.append(f"\n  ● {stripped[3:]}")
+            elif stripped.startswith("# "):
+                cleaned.append(f"\n{'─' * 40}\n  🎯 {stripped[2:]}\n{'─' * 40}")
+            # Listas con viñetas
+            elif stripped.startswith("- ") or stripped.startswith("* "):
+                cleaned.append(f"    • {stripped[2:]}")
+            # Listas numeradas
+            elif len(stripped) > 2 and stripped[0].isdigit() and stripped[1] in (".", ")"):
+                cleaned.append(f"    {stripped}")
+            # Negrita **texto**
+            elif "**" in stripped:
+                clean_line = stripped.replace("**", "")
+                cleaned.append(clean_line)
+            # Código inline `comando`
+            elif "`" in stripped:
+                clean_line = stripped.replace("`", "")
+                cleaned.append(clean_line)
+            else:
+                cleaned.append(line)
+
+        return "\n".join(cleaned)
+
     # ── Helpers ──────────────────────────────────────────────────────────────
+    def _reset_scan(self):
+        """Reinicia la interfaz para un nuevo escaneo."""
+        # Detener escaneo activo si lo hay
+        if self._scanning:
+            self._scanning = False
+
+        # Limpiar campo de objetivo y poner foco
+        self._target_var.set("")
+        # Buscar el entry de target y darle foco
+        for widget in self.winfo_children():
+            self._focus_target_entry(widget)
+
+        # Reiniciar barra de progreso y estado
+        self._progress["value"] = 0
+        self._set_status("Listo", "info")
+
+        # Limpiar log
+        self._log_text.config(state=NORMAL)
+        self._log_text.delete("1.0", END)
+        self._log_text.config(state=DISABLED)
+
+        # Limpiar pestañas de resultados
+        for key, widget in self._result_texts.items():
+            widget.config(state=NORMAL)
+            widget.delete("1.0", END)
+            widget.config(state=DISABLED)
+
+        # Limpiar pestaña IA
+        self._set_ia_text("")
+        self._populate_snippets([])
+        self._ia_status_label.config(
+            text="Activa 'Sugerencia IA' para enviar automáticamente al finalizar",
+            bootstyle="secondary",
+        )
+
+        # Reactivar todos los checkboxes de escaneo
+        for var in self._scan_vars.values():
+            var.set(True)
+
+        # Restaurar botones
+        self._scan_btn.config(state=NORMAL)
+        self._stop_btn.config(state=DISABLED)
+
+        # Ir a la pestaña de Log
+        self._notebook.select(0)
+
+        # Refrescar reportes
+        self._refresh_reports()
+
+    def _focus_target_entry(self, widget):
+        """Busca recursivamente el Entry de target y le da foco."""
+        if isinstance(widget, ttk.Entry):
+            try:
+                if str(widget.cget("textvariable")) == str(self._target_var):
+                    widget.focus_set()
+                    return
+            except Exception:
+                pass
+        for child in widget.winfo_children():
+            self._focus_target_entry(child)
+
     def _check_nmap(self):
         if nmap_installed():
             try:
@@ -444,6 +964,24 @@ class ScannerApp(ttk.Window):
             self.after(0, self._set_status, "¡Escaneo finalizado!", "success")
             self.after(0, self._log, "\n[+] ¡Escaneo finalizado! Revisa los reportes generados.")
             self.after(100, self._refresh_reports)
+
+            # Enviar automáticamente a n8n si el checkbox está activo
+            if self._ia_var.get():
+                all_results = {}
+                for s in scans:
+                    widget = self._result_texts.get(s["key"])
+                    if widget:
+                        widget.config(state=NORMAL)
+                        txt = widget.get("1.0", END).strip()
+                        widget.config(state=DISABLED)
+                        if txt:
+                            all_results[s["key"]] = txt
+                if all_results:
+                    self.after(0, self._log, "\n[+] Enviando resultados a n8n para sugerencias IA…")
+                    threading.Thread(
+                        target=self._send_to_n8n, args=(target, all_results), daemon=True
+                    ).start()
+
         self._scanning = False
         self.after(0, self._scan_btn.config, {DISABLED: False, "state": NORMAL})
         self.after(0, self._stop_btn.config, {"state": DISABLED})
